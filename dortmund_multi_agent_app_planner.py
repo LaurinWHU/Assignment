@@ -352,8 +352,18 @@ with st.sidebar:
 from openai import OpenAI
 from langchain_openai import ChatOpenAI
 
+# Explicit timeouts prevent infinite spinners when an LLM call hangs.
+# 45s per call is generous for 120B models; total budget across all agents
+# in a compound query stays within Streamlit's ~2min window.
+LLM_TIMEOUT_SECONDS = 45
+
 # Direct client (used by planner, coding, visual, editor agents)
-client = OpenAI(api_key=llm_api_key, base_url=llm_base_url)
+client = OpenAI(
+    api_key=llm_api_key,
+    base_url=llm_base_url,
+    timeout=LLM_TIMEOUT_SECONDS,
+    max_retries=1,  # internal SDK retries — keep low so we fail fast on hangs
+)
 
 # LangChain client (used by the RAG text agent)
 langchain_llm = ChatOpenAI(
@@ -361,6 +371,8 @@ langchain_llm = ChatOpenAI(
     base_url=llm_base_url,
     api_key=llm_api_key,
     temperature=0.1,
+    timeout=LLM_TIMEOUT_SECONDS,
+    max_retries=1,
 )
 
 LLM_MODEL = llm_model  # used everywhere the agents call the direct client
@@ -1158,7 +1170,9 @@ def evaluator_agent(original_question: str, results: list[dict], facts_block: st
     )
 
     try:
-        completion = client.chat.completions.create(
+        # Tighter timeout for the evaluator — it's optional, not on the critical path.
+        # If it hangs or is slow, we'd rather skip and let the editor run.
+        completion = client.with_options(timeout=20).chat.completions.create(
             model=LLM_MODEL,
             messages=[{"role": "user", "content": prompt}],
             temperature=0.1,
@@ -1175,7 +1189,7 @@ def evaluator_agent(original_question: str, results: list[dict], facts_block: st
                 "raw": raw,
             }
     except Exception as e:
-        return {"passed": True, "feedback": f"Evaluator skipped: {e}", "suggested_fix": None, "raw": ""}
+        return {"passed": True, "feedback": f"Evaluator skipped: {type(e).__name__}", "suggested_fix": None, "raw": ""}
     return {"passed": True, "feedback": "Evaluator returned unparseable output", "suggested_fix": None, "raw": ""}
 
 
@@ -1471,11 +1485,13 @@ if submit and question:
 
     progress.empty()
 
-    # ---- STEP 2.5: Evaluator Agent (only when TOKEN_SAVING is OFF) ----
+    # ---- STEP 2.5: Evaluator Agent (only when TOKEN_SAVING is OFF AND not on Cloud) ----
     # Improvement Point 2 — LLM-as-a-judge validates sub-task results against the
     # original question and ground-truth facts BEFORE the editor writes the final answer.
+    # On Streamlit Cloud the total request budget (~2 min) is too tight for the extra
+    # evaluator call on top of a compound query, so we skip it there.
     evaluator_result = None
-    if not TOKEN_SAVING:
+    if not TOKEN_SAVING and not IS_CLOUD:
         with st.spinner("🔍 Evaluator reviewing answer quality…"):
             facts_for_eval, _ = compute_data_facts()
             evaluator_result = evaluator_agent(
