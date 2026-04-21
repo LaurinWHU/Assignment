@@ -1,0 +1,29 @@
+# Requirements for dortmund_multi_agent_app_planner.py
+# WHU Dortmund Multi-Agent Assistant (dual provider: Groq + WHU Ollama)
+
+# Core
+streamlit>=1.30.0
+pandas>=2.0.0
+openpyxl>=3.1.0
+
+# Visualization
+matplotlib>=3.7.0
+plotly>=5.18.0
+
+# Unified LLM client (OpenAI-compatible — works for both Groq and WHU Ollama)
+openai>=1.40.0
+langchain-openai>=0.1.0
+
+# LangChain core + RAG
+langchain>=0.1.0
+langchain-community>=0.0.20
+langchain-core>=0.1.0
+
+# Embeddings
+sentence-transformers>=2.2.0
+
+# Vector store
+faiss-cpu>=1.7.4
+
+# BM25 keyword retrieval (Hybrid Retrieval — Improvement #5)
+rank-bm25>=0.2.2
