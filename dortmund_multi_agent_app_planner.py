@@ -205,15 +205,38 @@ with st.sidebar:
     )
 
     # --- Provider ---
-    st.markdown("### Provider")
-    provider = st.radio(
-        "Provider",
-        options=["Groq (cloud)", "WHU Ollama (VPN)"],
-        index=0,
-        label_visibility="collapsed",
-        help="Groq: fast cloud inference (requires API key). "
-             "WHU Ollama: on-premise (requires eduVPN).",
+    # Detect Streamlit Cloud: the WHU Ollama endpoint is unreachable from cloud
+    # deployments (requires eduVPN). Detect via a known env var set by Streamlit
+    # Cloud, and also fall back to a simple hostname check.
+    IS_CLOUD = (
+        os.getenv("STREAMLIT_SHARING_MODE") is not None
+        or os.getenv("HOSTNAME", "").startswith("streamlit-")
+        or "/mount/src/" in os.path.abspath(__file__)  # reliable: Cloud mounts repos here
     )
+
+    st.markdown("### Provider")
+    if IS_CLOUD:
+        # Only Groq is usable on Streamlit Cloud
+        provider = "Groq (cloud)"
+        st.radio(
+            "Provider",
+            options=["Groq (cloud)"],
+            index=0,
+            label_visibility="collapsed",
+            disabled=True,
+            help="WHU Ollama is only reachable from within the WHU network (requires eduVPN). "
+                 "Clone the repo and run the app locally to use the on-premise option.",
+        )
+        st.caption("ℹ️ Cloud deployment — WHU Ollama disabled (VPN unreachable from cloud)")
+    else:
+        provider = st.radio(
+            "Provider",
+            options=["Groq (cloud)", "WHU Ollama (VPN)"],
+            index=0,
+            label_visibility="collapsed",
+            help="Groq: fast cloud inference (requires API key). "
+                 "WHU Ollama: on-premise (requires eduVPN).",
+        )
 
     # --- Model dropdown (varies per provider) ---
     st.markdown("### Model")
@@ -1340,8 +1363,40 @@ with col_btn:
 if submit and question:
 
     # ---- STEP 1: Planner ----
-    with st.spinner("🧠 Planner decomposing question into sub-tasks..."):
-        tasks, planner_raw_output = planner_agent(question)
+    try:
+        with st.spinner("🧠 Planner decomposing question into sub-tasks..."):
+            tasks, planner_raw_output = planner_agent(question)
+    except Exception as e:
+        err_type = type(e).__name__
+        msg = str(e)
+        if "APIConnectionError" in err_type or "ConnectionError" in err_type or "connect" in msg.lower():
+            st.error(
+                f"🔌 **Could not connect to the LLM provider.**\n\n"
+                f"**Current provider:** {provider}  \n"
+                f"**Model:** `{llm_model}`\n\n"
+                f"Possible causes:\n"
+                f"- You selected **WHU Ollama** but eduVPN is not active, or you are on Streamlit Cloud (VPN unreachable)\n"
+                f"- Your Groq API key is invalid or expired\n"
+                f"- The LLM endpoint is temporarily down\n\n"
+                f"*Technical detail:* {err_type}"
+            )
+        elif "RateLimitError" in err_type or "429" in msg:
+            st.error(
+                f"⏳ **Rate limit reached on {provider}.**\n\n"
+                f"Try one of:\n"
+                f"- Enable **Token-saving mode** in the sidebar\n"
+                f"- Switch to a different model with its own quota (e.g. `openai/gpt-oss-120b`)\n"
+                f"- Wait ~40 minutes for the rolling quota window to free up\n\n"
+                f"*Details:* {msg[:300]}"
+            )
+        elif "AuthenticationError" in err_type or "401" in msg:
+            st.error(
+                f"🔑 **Authentication failed.** The API key appears to be invalid or missing.\n\n"
+                f"Paste a fresh key from https://console.groq.com/keys into the sidebar."
+            )
+        else:
+            st.error(f"❌ Unexpected error in Planner: {err_type}: {msg[:500]}")
+        st.stop()
 
     # Show the plan (stays visible so the user sees the decomposition)
     emoji_map = {"code": "💻", "visual": "📊", "text": "📝"}
