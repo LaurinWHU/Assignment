@@ -522,7 +522,7 @@ def setup_text_analysis_agent(compact: bool = False, rag_k: int = 5, hybrid: boo
         + "- For ANY number / count / statistic / range → use the DATASET FACTS section. These are ground truth.\n"
         + "- For qualitative info about specific companies → use the RETRIEVED ROWS section.\n"
         + "- Do NOT invent numbers. If unsure, say 'this is not available in the dataset'.\n"
-        + "- Answer in the user's language (German if the question is German, English otherwise).\n"
+        + "- Answer in English.\n"
     )
     prompt = ChatPromptTemplate.from_template(template)
     return (
@@ -558,7 +558,7 @@ def setup_data_context(compact: bool = False):
         f"\nCategory flags (0/1) from Phase 2 clustering: {CATEGORY_COLUMNS}"
         if CATEGORY_COLUMNS else
         "\n⚠️ Category flags from Phase 2 clustering are NOT yet available.\n"
-        "When the user asks about 'Kategorien', 'Branchen', 'Sektoren', 'categories' or 'industries',\n"
+        "When the user asks about 'categories', 'industries', 'sectors', or 'branches',\n"
         "treat 'NACE Rev. 2 main section' as the category column."
     )
 
@@ -602,7 +602,7 @@ When asked a question, generate Python pandas code that operates on the datafram
 Rules:
 - The code MUST end by storing the answer in a variable called 'result'.
 - ALWAYS aggregate before presenting — never dump 1000+ raw rows as the result.
-- "Kategorien" / "Branchen" / "Sektoren" → use 'NACE Rev. 2 main section'.
+- "categories" / "industries" / "sectors" / "branches" → use 'NACE Rev. 2 main section'.
 - Use pd.to_numeric(..., errors='coerce') for any scaling column that may contain 'n.a.'.
 - Keep results compact: top-N, sums, means, or small tables.
 
@@ -623,7 +623,7 @@ You are a data visualization expert. Generate Python code that:
 
 CRITICAL rules — violating these produces unreadable charts:
 
-A. "Kategorien" / "Branchen" / "Sektoren" / "categories" / "industries" mapping:
+A. "categories" / "industries" / "sectors" / "branches" mapping:
    → Use 'NACE Rev. 2 main section' as the category column. This is the ONLY proper
      categorical dimension in the CURRENT dataset. Do NOT invent categories from
      scaling flags (Scaler, Gazelle, Mature, ...) — those are boolean growth indicators,
@@ -651,7 +651,7 @@ D. When scaling columns contain 'n.a.' strings, convert with
 E. Rename columns meaningfully before plotting so the legend/labels are readable
    (e.g. 'Number of companies', 'NACE sector', 'Scalers in 2024').
 
-F. Title and axis labels: use the user's language (German if the question is German).
+F. Titles, axis labels, and legends must be in English.
 
 G. DO NOT call fig.show() or plt.show() — Streamlit renders the figure itself via st.plotly_chart(fig). Any .show() call opens an unwanted browser popup in Codespaces/VS Code.
 
@@ -684,7 +684,7 @@ Rules:
 3. Order matters: put data/charts first, then analytical text that may reference them.
 4. Each sub-question must stand alone — later agents cannot see earlier outputs at execution time.
 5. Maximum 4 tasks.
-6. Use the user's language (German or English) when formulating sub-questions.
+6. Formulate sub-questions in English.
 
 Examples:
 
@@ -701,10 +701,10 @@ User: "Show a chart of scalers by NACE sector and write a short report about it"
   {"approach":"text","question":"Summarise which industries dominate scaling in Dortmund and why they may be leading"}
 ]}
 
-User: "Wieviele Firmen gibt es pro Branche und erstelle ein Kuchendiagramm"
+User: "How many companies are in each industry, and make a pie chart"
 {"tasks":[
-  {"approach":"code","question":"Wie viele Firmen gibt es pro NACE Rev. 2 main section? Gib das Ergebnis als Tabelle zurück."},
-  {"approach":"visual","question":"Erstelle ein Kreisdiagramm der Verteilung der Firmen über die NACE Rev. 2 main sections"}
+  {"approach":"code","question":"How many companies are in each NACE Rev. 2 main section? Return the result as a table."},
+  {"approach":"visual","question":"Create a pie chart showing the distribution of companies across NACE Rev. 2 main sections"}
 ]}
 
 Now plan the tasks for the user question below.
@@ -1030,7 +1030,7 @@ def visual_agent(question: str, visual_context: str, df: pd.DataFrame):
             f"Your previous chart has an issue:\n{feedback}\n\n"
             "Regenerate the plotly code to address this. Output ONLY the corrected Python code, "
             "no explanations. Store the figure in a variable called `fig`. "
-            "Remember: aggregate before plotting; pie charts ≤ 10 slices; 'Kategorien' means NACE Rev. 2 main section."
+            "Remember: aggregate before plotting; pie charts ≤ 10 slices; 'categories' means NACE Rev. 2 main section."
         )
         code_to_run = _generate_code(visual_context, retry_msg, history)
 
@@ -1175,15 +1175,15 @@ def final_editor_agent(original_question: str, results: list[dict], extra_contex
 === LAYOUT CONTEXT ===
 - Any charts generated by visual sub-tasks are rendered DIRECTLY ABOVE your text in the same answer block.
 - There is NO separate "report" section — your text IS the report.
-- Reference charts naturally: "Das Kreisdiagramm oben zeigt…", "Wie im Balkendiagramm ersichtlich…"
+- Reference charts naturally: "The pie chart above shows…", "As visible in the bar chart…"
 
 === RULES ===
 1. Write ONE unified answer that addresses the ORIGINAL question as a whole.
 2. Base every numeric claim on either (a) GROUND TRUTH FACTS, (b) successful sub-task results, or (c) the chart rendered above.
 3. Do NOT invent numbers. Do NOT round aggressively.
 4. CRITICAL — avoid mixing metrics without signposting:
-   - The chart above shows ONE specific metric (e.g. "share of scalers per sector"). When you quote a % from the chart, label it clearly: "16.8% *der Scaler*", NOT just "16.8%".
-   - If you additionally use total-dataset counts from GROUND TRUTH FACTS (e.g. "G has 187 companies total"), label them clearly: "insgesamt 187 Firmen (nicht nur Scaler)".
+   - The chart above shows ONE specific metric (e.g. "share of scalers per sector"). When you quote a % from the chart, label it clearly: "16.8% *of scalers*", NOT just "16.8%".
+   - If you additionally use total-dataset counts from GROUND TRUTH FACTS (e.g. "G has 187 companies total"), label them clearly: "187 companies in total (not only scalers)".
    - NEVER write a sentence that reads as if chart-%-values and total-company-counts describe the same thing.
 5. Structure for compound questions: if the user asked for BOTH a chart-specific view AND a broader report, organise the text into two clearly distinguishable paragraphs:
    • Paragraph 1: what the chart reveals (chart metric)
@@ -1192,7 +1192,7 @@ def final_editor_agent(original_question: str, results: list[dict], extra_contex
    - Do NOT say "sub-process failed" or "could not be determined".
    - Silently fall back to the GROUND TRUTH FACTS.
    - Only if truly absent from both sources, say so briefly.
-7. Use the user's language (German if the question is German).
+7. Write the final answer in English.
 8. Aim for 5–12 sentences. End with a one-line "Key takeaway" if the user asked for a summary/report.
 
 Now write the final answer:"""
@@ -1266,18 +1266,18 @@ st.markdown("### Ask a question")
 # --- Examples as clickable suggestions in tabs ---
 EXAMPLES = {
     "Quick Q&A": [
-        "Wie viele Scaler gibt es 2024?",
-        "Wer sind die Top-5 Arbeitgeber in Dortmund?",
-        "Wie hat sich die Anzahl Scaler 2020–2024 entwickelt?",
+        "How many scalers were there in 2024?",
+        "Who are the top 5 employers in Dortmund?",
+        "How did the number of scalers evolve from 2020 to 2024?",
     ],
     "With chart": [
-        "Erstelle ein Balkendiagramm der NACE-Sektoren in Dortmund",
-        "Zeig mir ein Kreisdiagramm der Top-10 Sektoren",
-        "Line chart: Scaler count by year 2020 to 2024",
+        "Create a bar chart of NACE sectors in Dortmund",
+        "Show me a pie chart of the top 10 sectors",
+        "Line chart: scaler count by year 2020 to 2024",
     ],
     "Compound": [
-        "Gib mir eine Übersicht über Dortmund: Kreisdiagramm der Top-Sektoren, Anzahl Scaler 2024, und kurzer Bericht",
-        "Top 3 NACE-Sektoren mit Scaler-Anteil plus Erklärung warum sie führen",
+        "Give me an overview of Dortmund: pie chart of top sectors, number of scalers 2024, and a short report",
+        "Top 3 NACE sectors by scaler share plus explanation why they lead",
     ],
 }
 
@@ -1297,7 +1297,7 @@ for tab, (label, items) in zip(tabs, EXAMPLES.items()):
 question = st.text_area(
     "Your question",
     value=st.session_state.question_text,
-    placeholder="e.g., Erstelle ein Diagramm der Sektoren und schreibe einen kurzen Bericht",
+    placeholder="e.g., Create a chart of the sectors and write a short report",
     height=90,
     label_visibility="collapsed",
     key="question_input",
