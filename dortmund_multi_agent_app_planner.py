@@ -353,9 +353,8 @@ from openai import OpenAI
 from langchain_openai import ChatOpenAI
 
 # Explicit timeouts prevent infinite spinners when an LLM call hangs.
-# 45s per call is generous for 120B models; total budget across all agents
-# in a compound query stays within Streamlit's ~2min window.
-LLM_TIMEOUT_SECONDS = 45
+# Ollama (on-premise, often CPU/shared GPU) needs more time than Groq LPUs.
+LLM_TIMEOUT_SECONDS = 120 if provider == "WHU Ollama (VPN)" else 45
 
 # Direct client (used by planner, coding, visual, editor agents)
 client = OpenAI(
@@ -480,6 +479,8 @@ def format_facts_block(facts: dict, compact: bool = False) -> str:
     if compact:
         L = []
         L.append("=== DATASET FACTS (compact — use exact numbers, do not invent) ===")
+        L.append("AVAILABLE YEARS: Scaling metrics 2020-2024 only. Employee counts 2017-2024.")
+        L.append("Queries outside these ranges must be refused — do NOT assume 2019 or 2025 exist.")
         L.append(f"Total companies: {facts['n_total']} | Active: {facts['n_active']}")
         L.append(f"Founded: {facts['founded_min']}-{facts['founded_max']} | "
                  f"Employees 2024: min={facts['emp_min']}, max={facts['emp_max']}, "
@@ -500,6 +501,9 @@ def format_facts_block(facts: dict, compact: bool = False) -> str:
     # Full version
     L = []
     L.append("=== DATASET FACTS (computed in Python from the FULL dataset — use these for ALL numeric claims) ===")
+    L.append("")
+    L.append("AVAILABLE YEARS: Scaling metrics (Scaler, Gazelle, Scaleup, etc.) exist ONLY for 2020-2024.")
+    L.append("Employee counts exist for 2017-2024. Queries outside these ranges must be refused.")
     L.append("")
     L.append(f"Total companies: {facts['n_total']}")
     L.append(f"Active companies: {facts['n_active']}")
@@ -714,6 +718,21 @@ C. Pie charts MUST have at most 10 slices. NACE has ~18 sections — for pie cha
 D. When scaling columns contain 'n.a.' strings, convert with
    pd.to_numeric(df['Scaler 2024'], errors='coerce') before summing/filtering.
 
+D.1 TIME SERIES OVER YEARS — CRITICAL SCHEMA PATTERN.
+    The dataset has SEPARATE columns per year, NOT a long-format "Year" column.
+    Example column names: 'Scaler 2020', 'Scaler 2021', ..., 'Scaler 2024' (each 0/1 per company).
+    There is NO single 'Year' column and NO single 'Scaler' column.
+
+    To plot "scaler count over the years 2020-2024" you MUST sum each yearly column:
+        years = [2020, 2021, 2022, 2023, 2024]
+        counts = [pd.to_numeric(df[f'Scaler {y}'], errors='coerce').sum() for y in years]
+        plot_df = pd.DataFrame({'Year': years, 'Scalers': counts})
+        fig = px.line(plot_df, x='Year', y='Scalers', title='Number of scalers 2020–2024', markers=True)
+
+    ⚠️ DO NOT attempt `df.value_counts()` grouped on 'Scaler 2024' and 'Founded Year' —
+    'Founded Year' is the year a company was FOUNDED, not the year of the scaler flag.
+    These are different axes and mixing them produces meaningless charts.
+
 E. Rename columns meaningfully before plotting so the legend/labels are readable
    (e.g. 'Number of companies', 'NACE sector', 'Scalers in 2024').
 
@@ -760,6 +779,14 @@ Rules:
 7. CRITICAL — "list of X" routing: any request for a list, roster, names, or enumeration of
    companies MUST go to the CODE agent (it sees all 1089 rows). The text agent only retrieves
    a handful of rows via semantic search and CANNOT produce complete lists.
+8. CRITICAL — DO NOT over-decompose. If the user asks for a SINGLE chart, use ONE visual task.
+   The visual agent does its own data aggregation using the full dataframe — you do NOT need
+   separate code tasks to "pre-compute data" for a chart. That would be wasted calls, because
+   sub-tasks cannot share their outputs. Examples of bad over-decomposition to AVOID:
+     ✗ "line chart of X by year" → [code: list years, code: get data, visual: chart]  ← WRONG
+     ✓ "line chart of X by year" → [visual: line chart of X by year]                   ← CORRECT
+   Only split into multiple tasks if the user explicitly asked for multiple DISTINCT outputs
+   (chart + number, chart + report, etc.).
 
 Examples:
 
@@ -768,6 +795,12 @@ User: "How many scalers in 2024?"
 
 User: "Give me a list of scalers in 2024"
 {"tasks":[{"approach":"code","question":"Return the full list of company names where Scaler 2024 == 1. Store as a Python list in `result`."}]}
+
+User: "Line chart: scaler count by year 2020 to 2024"
+{"tasks":[{"approach":"visual","question":"Line chart showing how many companies were scalers each year from 2020 to 2024. Sum the binary columns 'Scaler 2020' through 'Scaler 2024' (each is 0/1 per company) to get one count per year."}]}
+
+User: "How did the number of scalers evolve from 2020 to 2024?"
+{"tasks":[{"approach":"code","question":"Return the scaler count per year as a table. Sum each binary column 'Scaler 2020' through 'Scaler 2024' (0/1 per company) and return {2020: count, 2021: count, ..., 2024: count}."}]}
 
 User: "Which are the 10 largest employers in Dortmund?"
 {"tasks":[{"approach":"code","question":"Return the top 10 companies by 'Number of employees 2024' as a DataFrame with company name and employee count."}]}
@@ -1005,22 +1038,41 @@ def _check_fig_quality(fig) -> str | None:
     if fig is None:
         return "Figure is None — no chart was produced."
     try:
-        # Pie charts: check for too many slices
+        # Check that the figure has any data traces at all
+        if not fig.data:
+            return ("The figure has no data traces. Did the filter/aggregation produce "
+                    "an empty DataFrame? Check the filter conditions and column names.")
+
         for trace in fig.data:
             t = trace.type if hasattr(trace, "type") else ""
             if t == "pie":
                 n = len(trace.labels) if getattr(trace, "labels", None) is not None else 0
+                if n == 0:
+                    return "Pie chart has zero slices. The aggregation produced no data."
+                if n == 1:
+                    return ("Pie chart has only 1 slice — not a meaningful chart. "
+                            "Check whether your filter removed too many rows.")
                 if n > 12:
                     return (f"The pie chart has {n} slices — far too many to read. "
                             "Use a bar chart instead, OR keep only the top 9 categories "
                             "and group the rest into 'Other'.")
             if t in ("bar", "histogram"):
-                # Bar charts with > 40 categories are unreadable
                 x = getattr(trace, "x", None)
-                if x is not None and len(x) > 40:
-                    return (f"The bar chart has {len(x)} bars — too many. "
+                n = len(x) if x is not None else 0
+                if n == 0:
+                    return "Bar chart has zero bars. The aggregation produced no data."
+                if n > 40:
+                    return (f"The bar chart has {n} bars — too many. "
                             "Show only the top 20 and group the rest, "
                             "OR switch to a horizontal bar chart if labels are long.")
+            if t in ("scatter", "line", "scattergl"):
+                x = getattr(trace, "x", None)
+                n = len(x) if x is not None else 0
+                if n == 0:
+                    return "Line/scatter chart has no data points."
+                if n == 1:
+                    return ("Line/scatter chart has only 1 data point — cannot show a trend. "
+                            "Check whether you're iterating across all expected categories/years.")
     except Exception:
         pass
     return None
@@ -1462,26 +1514,55 @@ if submit and question:
         sub_q = task["question"]
         progress.info(f"⏳ Step {i}/{len(tasks)} — {emoji_map[approach]} {approach.upper()} Agent working…")
 
-        if approach == "text":
-            raw = text_analysis_agent(sub_q, rag_chain)
-            results.append({"approach": approach, "question": sub_q, "raw_answer": raw})
+        # Wrap each executor so a single timeout doesn't crash the whole pipeline.
+        # The Editor will see "[FAILED]" results and fall back to ground-truth facts.
+        try:
+            if approach == "text":
+                raw = text_analysis_agent(sub_q, rag_chain)
+                results.append({"approach": approach, "question": sub_q, "raw_answer": raw})
 
-        elif approach == "visual":
-            fig, code_used, log = visual_agent(sub_q, visual_context, df)
-            if fig is not None:
-                figures.append((sub_q, fig))
-            code_snippets.append((f"📊 Visual — {sub_q}", code_used))
-            retry_logs.append((f"📊 {sub_q}", log))
+            elif approach == "visual":
+                fig, code_used, log = visual_agent(sub_q, visual_context, df)
+                if fig is not None:
+                    figures.append((sub_q, fig))
+                code_snippets.append((f"📊 Visual — {sub_q}", code_used))
+                retry_logs.append((f"📊 {sub_q}", log))
+                results.append({
+                    "approach": approach, "question": sub_q,
+                    "raw_answer": "Visualisation generated." if fig is not None else "Chart generation failed.",
+                })
+
+            else:  # code
+                raw, code_used, log = coding_agent(sub_q, data_context, df)
+                code_snippets.append((f"💻 Code — {sub_q}", code_used))
+                retry_logs.append((f"💻 {sub_q}", log))
+                results.append({"approach": approach, "question": sub_q, "raw_answer": str(raw)})
+
+        except Exception as e:
+            err_type = type(e).__name__
+            is_timeout = "Timeout" in err_type or "timed out" in str(e).lower()
+            is_rate_limit = "RateLimit" in err_type or "429" in str(e)
+            is_connection = "Connection" in err_type
+
+            if is_timeout:
+                friendly = (
+                    f"⏱️ The {approach} agent timed out after "
+                    f"{LLM_TIMEOUT_SECONDS}s. The current model ({llm_model}) is likely slow or overloaded. "
+                    f"Try: a smaller / faster model, a different provider, or enable Token-saving mode."
+                )
+            elif is_rate_limit:
+                friendly = f"⏳ Rate limit hit during the {approach} sub-task. Wait a few minutes or switch model."
+            elif is_connection:
+                friendly = f"🔌 Connection error in the {approach} sub-task. If you're using WHU Ollama, check your eduVPN."
+            else:
+                friendly = f"❌ The {approach} sub-task failed: {err_type}"
+
+            st.warning(friendly)
+            retry_logs.append((f"{emoji_map[approach]} {sub_q}", [f"✗ {err_type}: {str(e)[:200]}"]))
             results.append({
                 "approach": approach, "question": sub_q,
-                "raw_answer": "Visualisation generated." if fig is not None else "Chart generation failed.",
+                "raw_answer": f"Sub-task failed with {err_type}. Editor should fall back to ground-truth facts.",
             })
-
-        else:  # code
-            raw, code_used, log = coding_agent(sub_q, data_context, df)
-            code_snippets.append((f"💻 Code — {sub_q}", code_used))
-            retry_logs.append((f"💻 {sub_q}", log))
-            results.append({"approach": approach, "question": sub_q, "raw_answer": str(raw)})
 
     progress.empty()
 
