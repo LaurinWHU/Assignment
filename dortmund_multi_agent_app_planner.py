@@ -651,10 +651,14 @@ When asked a question, generate Python pandas code that operates on the datafram
 
 Rules:
 - The code MUST end by storing the answer in a variable called 'result'.
-- ALWAYS aggregate before presenting — never dump 1000+ raw rows as the result.
+- AGGREGATE by default — counts, sums, means, top-N; never dump 1000+ raw rows as the result UNLESS…
+- EXCEPTION: if the sub-question explicitly asks for "list", "all companies", "names of", "roster",
+  return the FULL list (up to ~200 rows is fine). Use `.tolist()` for names or a small
+  DataFrame with just the relevant columns. Example:
+      result = df.loc[pd.to_numeric(df['Scaler 2024'], errors='coerce') == 1,
+                      'Company name Latin alphabet'].tolist()
 - "categories" / "industries" / "sectors" / "branches" → use 'NACE Rev. 2 main section'.
 - Use pd.to_numeric(..., errors='coerce') for any scaling column that may contain 'n.a.'.
-- Keep results compact: top-N, sums, means, or small tables.
 
 Return ONLY the executable Python code, no explanations.
 """
@@ -719,9 +723,15 @@ PLANNER_PROMPT = """You are a PLANNER agent for a Dortmund company dataset analy
 Your job is to break a user's request into one OR MORE focused sub-tasks.
 Each sub-task is handled by exactly ONE executor agent:
 
-- "code"   → quantitative pandas analysis (counts, averages, groupby, percentages, filtering)
-- "visual" → interactive plotly chart (bar, pie, line, scatter, histogram)
-- "text"   → qualitative RAG-based answer (describe, list, summarise, recommend)
+- "code"   → quantitative pandas analysis OR deterministic list extraction from the full dataframe.
+             USE THIS for: counts, averages, groupby, percentages, filtering, AND
+             whenever the user asks for "a list of X", "all X", "which companies are X",
+             "top N by Y" — the code agent operates on ALL 1089 rows and returns complete
+             results. Do NOT use text agent for list extraction — it only sees 3-5
+             retrieved rows and will hallucinate or truncate the list.
+- "visual" → interactive plotly chart (bar, pie, line, scatter, histogram).
+- "text"   → QUALITATIVE narrative answers ONLY: explain, describe reasons, contextualise,
+             summarise a concept. NEVER use text for factual lookups or complete lists.
 
 Return a JSON object with a single key "tasks". Its value is a list of task objects.
 Each task has exactly two fields:
@@ -735,14 +745,26 @@ Rules:
 4. Each sub-question must stand alone — later agents cannot see earlier outputs at execution time.
 5. Maximum 4 tasks.
 6. Formulate sub-questions in English.
+7. CRITICAL — "list of X" routing: any request for a list, roster, names, or enumeration of
+   companies MUST go to the CODE agent (it sees all 1089 rows). The text agent only retrieves
+   a handful of rows via semantic search and CANNOT produce complete lists.
 
 Examples:
 
 User: "How many scalers in 2024?"
 {"tasks":[{"approach":"code","question":"How many companies have Scaler 2024 equal to 1?"}]}
 
+User: "Give me a list of scalers in 2024"
+{"tasks":[{"approach":"code","question":"Return the full list of company names where Scaler 2024 == 1. Store as a Python list in `result`."}]}
+
+User: "Which are the 10 largest employers in Dortmund?"
+{"tasks":[{"approach":"code","question":"Return the top 10 companies by 'Number of employees 2024' as a DataFrame with company name and employee count."}]}
+
 User: "Show a bar chart of companies per NACE sector"
 {"tasks":[{"approach":"visual","question":"Create a bar chart showing the number of companies per NACE Rev. 2 main section"}]}
+
+User: "Why are professional services growing faster than manufacturing?"
+{"tasks":[{"approach":"text","question":"Provide a qualitative explanation for why NACE section M (professional services) may be scaling faster than section C (manufacturing) in Dortmund."}]}
 
 User: "Show a chart of scalers by NACE sector and write a short report about it"
 {"tasks":[
@@ -1244,6 +1266,12 @@ def final_editor_agent(original_question: str, results: list[dict], extra_contex
    - Only if truly absent from both sources, say so briefly.
 7. Write the final answer in English.
 8. Aim for 5–12 sentences. End with a one-line "Key takeaway" if the user asked for a summary/report.
+9. LIST-STYLE QUESTIONS — if the user asked for a "list of X", "all X", "which companies are X",
+   and the code sub-task returned an actual Python list or DataFrame:
+   • Present the full list verbatim (as a bulleted list or table), NOT a summary.
+   • Do NOT write padding sentences like "the list includes notable companies such as…".
+   • Do NOT invent overall counts that differ from the length of the returned list.
+   • A brief 1-sentence intro ("Below are the N scalers identified in 2024:") is OK; no Key Takeaway needed.
 
 Now write the final answer:"""
 
