@@ -36,9 +36,25 @@ from langchain_core.output_parsers import StrOutputParser
 # DATA CONFIGURATION
 # =============================================================================
 
-DATA_FILE = "DORTMUND.csv"
-DATA_SOURCE_XLSX = "DORTMUND.xlsx"
-CATEGORY_COLUMNS: list[str] = []  # fill in after Phase 2
+DATA_FILE = "DORTMUND_categorized_vfinal.csv"
+DATA_SOURCE_XLSX = "DORTMUND_categorized_vfinal.xlsx"
+
+# 11 LLM-derived industry topics (binary 0/1 columns).
+# Reference category for the logistic regression: environment_utilities_recycling_energy
+# (its Scaler-rate sits exactly on the population baseline of 11.7%).
+CATEGORY_COLUMNS: list[str] = [
+    "industrial_machinery_metal_manufacturing",
+    "construction_building_architecture_hvac",
+    "it_software_digital_it_services",
+    "logistics_transport_warehousing_shipping",
+    "healthcare_nursing_pharmacy_medicine",
+    "finance_legal_tax_insurance",
+    "retail_wholesale_consumer_commerce",
+    "automotive_sales_vehicle_repairs",
+    "education_vocational_training_science",
+    "gastronomy_tourism_sports_leisure",
+    "environment_utilities_recycling_energy",
+]
 
 # =============================================================================
 # WHU BRANDING
@@ -345,6 +361,23 @@ with st.sidebar:
     else:
         st.caption("💬 Fresh conversation — first turn")
 
+    # Data refresh — useful when the dataset is edited while the app is running.
+    # Streamlit's @st.cache_data on the loading + facts functions would otherwise
+    # serve stale numbers until restart.
+    st.markdown("### Data")
+    if st.button("🔄 Reload dataset", use_container_width=True,
+                 help="Click after editing the source dataset to flush cached facts and re-read the file."):
+        st.cache_data.clear()
+        st.cache_resource.clear()
+        # Also remove the intermediate CSV so it's rebuilt cleanly
+        if os.path.exists(DATA_FILE):
+            try:
+                os.remove(DATA_FILE)
+            except OSError:
+                pass
+        st.success("Caches cleared — reloading…")
+        st.rerun()
+
 # =============================================================================
 # UNIFIED LLM CLIENTS — both providers expose an OpenAI-compatible interface
 # =============================================================================
@@ -354,7 +387,10 @@ from langchain_openai import ChatOpenAI
 
 # Explicit timeouts prevent infinite spinners when an LLM call hangs.
 # Ollama (on-premise, often CPU/shared GPU) needs more time than Groq LPUs.
+# The text agent (RAG chain) is heavier than the others — it embeds context,
+# retrieves docs, and generates qualitative explanations — so it gets a higher cap.
 LLM_TIMEOUT_SECONDS = 120 if provider == "WHU Ollama (VPN)" else 45
+LLM_TIMEOUT_TEXT_SECONDS = 180 if provider == "WHU Ollama (VPN)" else 90
 
 # Direct client (used by planner, coding, visual, editor agents)
 client = OpenAI(
@@ -364,13 +400,13 @@ client = OpenAI(
     max_retries=1,  # internal SDK retries — keep low so we fail fast on hangs
 )
 
-# LangChain client (used by the RAG text agent)
+# LangChain client (used by the RAG text agent — needs more headroom)
 langchain_llm = ChatOpenAI(
     model=llm_model,
     base_url=llm_base_url,
     api_key=llm_api_key,
     temperature=0.1,
-    timeout=LLM_TIMEOUT_SECONDS,
+    timeout=LLM_TIMEOUT_TEXT_SECONDS,
     max_retries=1,
 )
 
@@ -380,22 +416,48 @@ LLM_MODEL = llm_model  # used everywhere the agents call the direct client
 # DATA LOADING
 # =============================================================================
 
+def _get_xlsx_mtime() -> float:
+    """Return the modification time of the Excel source, or 0 if it doesn't exist.
+    Used as a cache key so the CSV is rebuilt whenever the Excel changes."""
+    if os.path.exists(DATA_SOURCE_XLSX):
+        return os.path.getmtime(DATA_SOURCE_XLSX)
+    return 0.0
+
+
 @st.cache_data
-def ensure_csv_exists() -> str | None:
+def ensure_csv_exists(xlsx_mtime: float) -> str | None:
     """Convert the Excel source to CSV if needed. Returns the CSV path, or None
     if neither the CSV nor the Excel source exists (e.g. when running on Streamlit
-    Cloud without the proprietary dataset committed to the repo)."""
-    if os.path.exists(DATA_FILE):
-        return DATA_FILE
+    Cloud without the proprietary dataset committed to the repo).
+
+    The xlsx_mtime parameter is part of the cache key — when the Excel file is
+    modified, mtime changes, the cache is invalidated, and the CSV is rebuilt
+    automatically. Users editing the source dataset don't need to manually clear the cache.
+    """
     if os.path.exists(DATA_SOURCE_XLSX):
+        # Always rebuild from the (possibly newer) Excel source — never trust an
+        # old CSV when the Excel exists, since the user may have edited it.
         df = pd.read_excel(DATA_SOURCE_XLSX)
         df.columns = [c.replace("\n", " ").strip() for c in df.columns]
+        # The merge of the company database with financial data left several
+        # columns with "_x" / "_y" suffixes. Normalize the ones the app refers to
+        # by their pre-merge name so downstream agents do not need to know.
+        rename_map = {
+            "Company name Latin alphabet_x": "Company name Latin alphabet",
+            "Country ISO code_x": "Country ISO code",
+            "City Latin Alphabet_x": "City Latin Alphabet",
+            "NACE Rev. 2, core code (4 digits)_x": "NACE Rev. 2, core code (4 digits)",
+        }
+        df = df.rename(columns={k: v for k, v in rename_map.items() if k in df.columns})
         df.to_csv(DATA_FILE, index=False, encoding="utf-8")
+        return DATA_FILE
+    if os.path.exists(DATA_FILE):
+        # Excel missing but CSV exists (e.g. cloud deployment with pre-converted data)
         return DATA_FILE
     return None
 
 
-csv_path = ensure_csv_exists()
+csv_path = ensure_csv_exists(_get_xlsx_mtime())
 
 if csv_path is None:
     st.warning(
@@ -404,7 +466,7 @@ if csv_path is None:
         f"which is proprietary and not included in the public repository.\n\n"
         f"**To run this app with real data:**\n"
         f"1. Clone the repository locally\n"
-        f"2. Place `DORTMUND.xlsx` in the project root\n"
+        f"2. Place `DORTMUND_categorized_vfinal.xlsx` in the project root\n"
         f"3. Run `streamlit run dortmund_multi_agent_app_planner.py`\n\n"
         f"The architecture (Planner → Executors → Editor pipeline with hybrid RAG, "
         f"self-correction, and sandboxed code execution) is fully functional — "
@@ -467,6 +529,28 @@ def compute_data_facts():
         "scaling_2024": {m: int(coerce(f"{m} 2024").sum()) for m in scaling_metrics},
         "scaler_by_year": {y: int(coerce(f"Scaler {y}").sum()) for y in [2020, 2021, 2022, 2023, 2024]},
     }
+
+    # --- Phase 1 enrichment columns (only present in DORTMUND_enriched) ---
+    # All checks gracefully degrade if a column is missing, so the app still
+    # works with the legacy DORTMUND.xlsx if a user swaps the file back.
+    if "primary_offering_category" in df.columns:
+        offering = df["primary_offering_category"].fillna("Not found").astype(str).str.strip()
+        # Top categories — exclude "Not found" from the rank to surface real signal
+        valid = offering[offering.str.lower() != "not found"]
+        facts["top_offerings"] = valid.value_counts().head(10).to_dict()
+        facts["n_offering_not_found"] = int((offering.str.lower() == "not found").sum())
+    if "english_website_flag" in df.columns:
+        facts["english_website_dist"] = df["english_website_flag"].value_counts().to_dict()
+    if "digital_presence_score" in df.columns:
+        dp = pd.to_numeric(df["digital_presence_score"], errors="coerce")
+        facts["digital_presence"] = {
+            "mean": round(float(dp.mean()), 2) if dp.notna().any() else None,
+            "dist": dp.dropna().astype(int).value_counts().sort_index().to_dict(),
+        }
+    if "confidence_score" in df.columns:
+        cs = pd.to_numeric(df["confidence_score"], errors="coerce")
+        facts["confidence_dist"] = cs.dropna().astype(int).value_counts().sort_index().to_dict()
+
     return facts, df
 
 
@@ -496,6 +580,17 @@ def format_facts_block(facts: dict, compact: bool = False) -> str:
         L.append(f"Scaler evolution: "
                  f"2020={facts['scaler_by_year'].get(2020, '?')} → "
                  f"2024={facts['scaler_by_year'].get(2024, '?')}")
+        # Phase 1 enrichment (compact)
+        if "top_offerings" in facts:
+            top3_off = list(facts["top_offerings"].items())[:3]
+            L.append("Top offerings (Phase 1): " +
+                     "; ".join(f"{k}={v}" for k, v in top3_off) +
+                     f" (Not found: {facts.get('n_offering_not_found', 0)})")
+        if "english_website_dist" in facts:
+            ew = facts["english_website_dist"]
+            L.append(f"English website: yes={ew.get('yes', 0)}, no={ew.get('no', 0)}, unknown={ew.get('unknown', 0)}")
+        if "digital_presence" in facts:
+            L.append(f"Digital presence score (1-5) mean: {facts['digital_presence'].get('mean')}")
         return "\n".join(L)
 
     # Full version
@@ -535,6 +630,35 @@ def format_facts_block(facts: dict, compact: bool = False) -> str:
     for y, cnt in facts["scaler_by_year"].items():
         L.append(f"  - {y}: {cnt} scalers")
     L.append("")
+
+    # --- Phase 1 enrichment block (only present in DORTMUND_enriched) ---
+    has_enrichment = any(k in facts for k in ("top_offerings", "english_website_dist",
+                                              "digital_presence", "confidence_dist"))
+    if has_enrichment:
+        L.append("=== PHASE 1 ENRICHMENT (Web-scraped + LLM-classified) ===")
+        L.append("")
+        if "top_offerings" in facts:
+            L.append(f"Primary offering categories (top 10, excluding 'Not found' which has "
+                     f"{facts.get('n_offering_not_found', 0)} companies):")
+            for cat, cnt in facts["top_offerings"].items():
+                L.append(f"  - {cat}: {cnt}")
+            L.append("")
+        if "english_website_dist" in facts:
+            ew = facts["english_website_dist"]
+            L.append(f"English website availability: yes={ew.get('yes', 0)}, "
+                     f"no={ew.get('no', 0)}, unknown={ew.get('unknown', 0)}")
+        if "digital_presence" in facts:
+            dp = facts["digital_presence"]
+            L.append(f"Digital presence score 1-5 (higher = stronger online presence) "
+                     f"— mean: {dp.get('mean')}")
+            if dp.get("dist"):
+                dist_str = ", ".join(f"{k}={v}" for k, v in dp["dist"].items())
+                L.append(f"  distribution: {dist_str}")
+        if "confidence_dist" in facts:
+            cs_str = ", ".join(f"{k}={v}" for k, v in facts["confidence_dist"].items())
+            L.append(f"Confidence score (1-5) distribution: {cs_str}")
+        L.append("")
+
     L.append("⚠️ Use these EXACT numbers when answering. Do not invent, estimate, or round.")
     return "\n".join(L)
 
@@ -612,9 +736,22 @@ def setup_data_context(compact: bool = False):
     facts_block = format_facts_block(facts, compact=compact)
 
     if compact:
-        # One-line column inventory, grouped by semantic role
+        # One-line column inventory, with Phase 1 enrichment columns explicitly listed
+        # so the LLM doesn't lose them in the long alphabetic list.
         col_names = list(df.columns)
-        columns_info = "Columns (72 total): " + ", ".join(col_names)
+        phase1_cols = [c for c in col_names if c in {
+            "company_website_url", "company_summary_short", "primary_offering_category",
+            "english_website_flag", "website_languages_count", "digital_presence_score",
+            "digital_presence_reason", "source_urls", "confidence_score"
+        }]
+        columns_info = (
+            f"Columns ({len(col_names)} total): " + ", ".join(col_names)
+        )
+        if phase1_cols:
+            columns_info += (
+                f"\n⚠️ KEY ENRICHMENT COLUMNS (Phase 1): {', '.join(phase1_cols)}. "
+                f"Use these EXACT names — they are case-sensitive and lowercase with underscores."
+            )
         sample_section = ""  # skip entirely
     else:
         columns_info = df.dtypes.to_string()
@@ -646,6 +783,41 @@ The dataset contains:
 - Binary scaling indicators per year (0/1 or 'n.a.'):
   'Scaler', 'HighGrowthFirm', 'ConsistentHighGrowthFirm', 'VeryHighGrowthFirm',
   'Gazelle', 'Mature', 'Scaleup', 'Superstar'
+- PHASE 1 ENRICHMENT (web-scraped + LLM-classified, ~99% coverage):
+  - 'company_website_url': company website URL (string, may be missing)
+  - 'company_summary_short': one-paragraph English summary of what the company does
+  - 'primary_offering_category': free-text category (e.g. "Logistics", "Construction Services",
+    "Legal services", "Retail", "IT services"). Use .str.strip() and .str.lower() to handle
+    case variants ("Construction Services" vs "Construction services"). Value "Not found" means
+    Phase 1 could not classify the company.
+  - 'english_website_flag': 'yes' / 'no' / 'unknown' — STRING column, NOT boolean.
+    To count companies WITH English websites, filter explicitly on the string:
+        result = (df['english_website_flag'] == 'yes').sum()      # → 355
+    Do NOT use .notna() or truthy-checks — every row has a value, so .notna() gives 1089.
+  - 'website_languages_count': number of languages on the website (mostly 1 or 2).
+  - 'digital_presence_score': integer 1-5, higher = stronger online presence.
+  - 'digital_presence_reason': free-text justification for the digital presence score.
+  - 'source_urls': URLs used by Phase 1 to enrich this company.
+  - 'confidence_score': integer 3-5, the LLM's self-assessed confidence in the classification.
+- PHASE 2 ENRICHMENT (LLM-derived industry topics, binary 0/1 columns, multi-label):
+  - 11 topic dummies, one per industry cluster: 'industrial_machinery_metal_manufacturing',
+    'construction_building_architecture_hvac', 'it_software_digital_it_services',
+    'logistics_transport_warehousing_shipping', 'healthcare_nursing_pharmacy_medicine',
+    'finance_legal_tax_insurance', 'retail_wholesale_consumer_commerce',
+    'automotive_sales_vehicle_repairs', 'education_vocational_training_science',
+    'gastronomy_tourism_sports_leisure', 'environment_utilities_recycling_energy'.
+  - A firm can belong to MULTIPLE topics (multi-label). Sum of dummies per firm is 0..3 typically.
+  - To count firms per topic: df[TOPIC_COLS].sum() where TOPIC_COLS is the list above.
+  - To compute Scaler-rate per topic: df[df[topic]==1]['Scaler 2024'].mean() for each topic.
+- HISTORICAL FINANCIAL RATIOS (per year 2020-2024):
+  - 'ROE using P/L before tax YYYY' — Return on Equity per year
+  - 'ROCE using P/L before tax YYYY' — Return on Capital Employed per year
+  - 'Solvency ratio (Asset based) YYYY' — Solvency ratio per year
+  - 'Profit margin YYYY', 'Current ratio YYYY' — additional ratios per year
+  - Raw figures per year: 'Operating revenue (Turnover) th USD YYYY',
+    'P/L before tax th USD YYYY', 'Total assets th USD YYYY', 'Shareholders funds th USD YYYY'
+  - These contain real numbers, but coverage decreases for older years (some firms missing 2020).
+  - Use pd.to_numeric(..., errors='coerce') before aggregating.
 {categories_note}
 
 Definitions (from the course):
@@ -655,6 +827,9 @@ Definitions (from the course):
 - Superstar: highest-growth tier
 
 When scaling columns contain 'n.a.' strings, convert with pd.to_numeric(errors='coerce') before aggregating.
+
+When grouping by 'primary_offering_category', normalize case first to avoid duplicate buckets:
+    cats = df['primary_offering_category'].fillna('Not found').astype(str).str.strip().str.title()
 """
     return base_context, df
 
@@ -675,6 +850,11 @@ Rules:
                       'Company name Latin alphabet'].tolist()
 - "categories" / "industries" / "sectors" / "branches" → use 'NACE Rev. 2 main section'.
 - Use pd.to_numeric(..., errors='coerce') for any scaling column that may contain 'n.a.'.
+- ROUND numeric results to at most 2 decimal places (use round(x, 2) or .round(2)).
+  Never return values like 2.8686131386861313 — that's noise, not signal.
+  For tuples / multi-value results, round each: result = (round(a, 2), round(b, 2)).
+- Available imports: pandas as pd, plotly.express as px. Do NOT import numpy unless you also write `import numpy as np`.
+  Prefer pandas idioms over numpy: use df.loc[condition, 'col'] instead of np.where, etc.
 
 Return ONLY the executable Python code, no explanations.
 """
@@ -816,6 +996,13 @@ User: "Show a chart of scalers by NACE sector and write a short report about it"
   {"approach":"visual","question":"Bar chart: number of companies where Scaler 2024 = 1, grouped by NACE Rev. 2 main section"},
   {"approach":"code","question":"Return the top 3 NACE sectors by count of companies with Scaler 2024 = 1"},
   {"approach":"text","question":"Summarise which industries dominate scaling in Dortmund and why they may be leading"}
+]}
+
+User: "Are scalers more digitally mature than non-scalers? Show the average score and explain"
+{"tasks":[
+  {"approach":"code","question":"Calculate the average digital_presence_score for scalers (Scaler 2024 == 1) and non-scalers (Scaler 2024 == 0). Return as a tuple (scaler_mean, non_scaler_mean) rounded to 2 decimals."},
+  {"approach":"visual","question":"Bar chart comparing the average digital_presence_score for two groups: scalers (Scaler 2024 == 1) and non-scalers (Scaler 2024 == 0). Use df.loc filter, .mean(), then plot two bars."},
+  {"approach":"text","question":"Given that scalers have a digital presence score of approximately 2.87 and non-scalers 2.79, explain whether this is a meaningful difference and what factors may drive it."}
 ]}
 
 User: "How many companies are in each industry, and make a pie chart"
@@ -1262,14 +1449,14 @@ def final_editor_agent(original_question: str, results: list[dict], extra_contex
     - In token-saving mode: skip the facts block (sub-tasks already carry the numbers)
     - Optional Evaluator feedback injection (Improvement Point 2)
     """
-    # In token-saving mode, sub-agent results already embed the facts — skip the
-    # duplicate facts injection to save ~1000 tokens per editor call.
-    include_facts = not TOKEN_SAVING
-    if include_facts:
-        facts, _ = compute_data_facts()
-        facts_block = format_facts_block(facts, compact=False)
-    else:
-        facts_block = ""
+    # ALWAYS include facts in the editor — this is the critical anti-hallucination
+    # cross-check. If a coding sub-task accidentally returns the dataset total (1089)
+    # instead of a filtered count, the editor MUST be able to spot that against the
+    # ground truth. In Token-saving mode we use the compact (~200 tok) version
+    # rather than the full (~1500 tok) one.
+    facts, _ = compute_data_facts()
+    facts_block = format_facts_block(facts, compact=TOKEN_SAVING)
+    include_facts = True  # kept for downstream conditional formatting
 
     blocks = []
     for i, r in enumerate(results, 1):
@@ -1319,6 +1506,19 @@ def final_editor_agent(original_question: str, results: list[dict], extra_contex
 1. Write ONE unified answer that addresses the ORIGINAL question as a whole.
 2. Base every numeric claim on either (a) GROUND TRUTH FACTS, (b) successful sub-task results, or (c) the chart rendered above.
 3. Do NOT invent numbers. Do NOT round aggressively.
+3a. SUSPICION CHECK — if a sub-task result equals the total dataset size (1089) or another suspiciously round
+    total, double-check against GROUND TRUTH FACTS. A common failure mode is a coding sub-task that
+    accidentally counted ALL rows instead of filtering. If GROUND TRUTH FACTS contains a more specific
+    number for the same question (e.g. "English website yes=355"), USE THAT instead and silently
+    correct the wrong sub-task value. Do NOT cite both.
+3b. EFFECT-SIZE HONESTY — when the user asks a comparison question ("are X more Y than Z"),
+    do not overstate small differences:
+    • If two means differ by < 0.10 on a 1-5 scale (or < 5% of the scale range), call it
+      "essentially the same" or "no meaningful difference" — NOT "higher" or "more mature".
+    • If two percentages differ by < 3 percentage points, call it "roughly equal" — not "X has more Y".
+    • Round numbers to 2 decimals when reporting; never keep noise digits like 2.8686131386861313.
+    • When a comparison shows no meaningful difference, that IS the finding — say so clearly.
+      Counter-intuitive null results are valuable insights, not failures to be glossed over.
 4. CRITICAL — avoid mixing metrics without signposting:
    - The chart above shows ONE specific metric (e.g. "share of scalers per sector"). When you quote a % from the chart, label it clearly: "16.8% *of scalers*", NOT just "16.8%".
    - If you additionally use total-dataset counts from GROUND TRUTH FACTS (e.g. "G has 187 companies total"), label them clearly: "187 companies in total (not only scalers)".
@@ -1326,10 +1526,14 @@ def final_editor_agent(original_question: str, results: list[dict], extra_contex
 5. Structure for compound questions: if the user asked for BOTH a chart-specific view AND a broader report, organise the text into two clearly distinguishable paragraphs:
    • Paragraph 1: what the chart reveals (chart metric)
    • Paragraph 2: broader context from the full dataset (total counts, top employers, etc.)
-6. If a sub-task FAILED:
-   - Do NOT say "sub-process failed" or "could not be determined".
-   - Silently fall back to the GROUND TRUTH FACTS.
-   - Only if truly absent from both sources, say so briefly.
+6. If a sub-task FAILED (timeout, error, etc.):
+   - Do NOT mention "sub-process failed", "could not be determined", "unfortunately", or similar phrases.
+   - Silently fill the missing piece using the GROUND TRUTH FACTS, your knowledge of the dataset, and
+     the successful sub-tasks. The user does NOT need to know that one sub-task failed.
+   - For a missing TEXT explanation: write the qualitative interpretation yourself in 2-3 sentences,
+     based on the numbers from the successful sub-tasks. You have the data and the question — that's
+     enough to produce a thoughtful answer.
+   - Only if truly impossible (e.g. all sub-tasks failed), say so briefly.
 7. Write the final answer in English.
 8. Aim for 5–12 sentences. End with a one-line "Key takeaway" if the user asked for a summary/report.
 9. LIST-STYLE QUESTIONS — if the user asked for a "list of X", "all X", "which companies are X",
@@ -1361,7 +1565,7 @@ with col_title:
     st.markdown(
         f'<h1 style="margin-bottom:0.25rem;">Dortmund Explorer</h1>'
         f'<p style="color:{WHU_DARK_GRAY};font-size:1rem;margin-top:0;">'
-        f'Multi-agent analysis of {1089} Dortmund companies (&gt;10 employees)'
+        f'Multi-agent analysis of 904 Dortmund companies (&gt;10 employees, with financial data)'
         f'</p>',
         unsafe_allow_html=True,
     )
@@ -1395,6 +1599,61 @@ m2.metric("Active", f"{active_count:,}")
 m3.metric("Scalers 2024", f"{scaler_count:,}")
 m4.metric("NACE Sectors", f"{n_sectors}")
 
+# --- Statistical Findings (collapsible, always available below the metrics) ---
+with st.expander("📊 **Statistical Findings — Logit Regression on Scaler 2024** (click to expand)"):
+    st.markdown(
+        f"""
+        <div style="font-size:0.92rem; color:{WHU_DARK_GRAY}; line-height:1.55;">
+        <b>Model:</b> <code>Scaler 2024 ~ 10 industry topics + firm_age + log(employees 2024)</code><br>
+        <b>Sample:</b> N = 896 firms · 106 positive (11.7%) · Pseudo&nbsp;R² = 0.131 ·
+        Reference topic: <code>environment_utilities_recycling_energy</code>
+        </div>
+        """,
+        unsafe_allow_html=True,
+    )
+
+    st.markdown("##### Significant predictors (p < 0.1)")
+    findings = pd.DataFrame([
+        ("gastronomy_tourism_sports_leisure",        2.21, 0.011, "↑ higher", "**"),
+        ("it_software_digital_it_services",          1.84, 0.035, "↑ higher", "**"),
+        ("finance_legal_tax_insurance",              1.75, 0.082, "↑ higher", "*"),
+        ("log_emp_2024",                             1.65, 0.000, "↑ higher", "***"),
+        ("firm_age",                                 0.97, 0.000, "↓ lower",  "***"),
+        ("retail_wholesale_consumer_commerce",       0.53, 0.032, "↓ lower",  "**"),
+        ("industrial_machinery_metal_manufacturing", 0.49, 0.051, "↓ lower",  "*"),
+    ], columns=["Predictor", "Odds Ratio", "p-value", "Effect", "Sig"])
+    st.dataframe(findings, hide_index=True, use_container_width=True)
+
+    c1, c2 = st.columns([2, 1])
+    with c1:
+        st.markdown("##### Forest plot")
+        if os.path.exists("fig_forest.png"):
+            st.image("fig_forest.png", use_container_width=True)
+        else:
+            st.info(
+                "Forest plot not found. Run `drt_statistical_analysis.ipynb` "
+                "to generate `fig_forest.png` in the project folder."
+            )
+    with c2:
+        st.markdown("##### Key takeaways")
+        st.markdown(
+            """
+- **IT/software firms** have **84 % higher odds** of scaling than the reference sector.
+- **Industrial manufacturing** has **51 % lower odds** — the lowest scaling industry in the sample.
+- **Larger and younger firms scale more often**: doubling employees → +65 % odds; each year older → −3 % odds.
+- The **construction effect from descriptive statistics disappears in the multivariate model** — its low scaling rate reflects firm demographics, not industry dynamics.
+"""
+        )
+
+    st.markdown("##### Methodological note")
+    st.caption(
+        "Topic structure cross-validated with BERTopic (unsupervised topic discovery): "
+        "**64.1 % agreement** between LLM and BERTopic clusters supports the validity of "
+        "the 11-topic taxonomy. Financial ratios (ROE, ROCE, Solvency) are excluded from "
+        "the main model due to reverse-causality concerns and listwise-deletion sample loss; "
+        "they remain available as descriptive context and in the underlying dataset."
+    )
+
 # Show conversation history if any (Multi-Turn Memory UI)
 if st.session_state.conversation_history:
     with st.expander(f"💬 Conversation history ({len(st.session_state.conversation_history)} previous turn(s))"):
@@ -1418,6 +1677,21 @@ EXAMPLES = {
         "Create a bar chart of NACE sectors in Dortmund",
         "Show me a pie chart of the top 10 sectors",
         "Line chart: scaler count by year 2020 to 2024",
+    ],
+    "Phase 1 (web)": [
+        "What are the top 10 primary offering categories?",
+        "How many companies have an English-language website?",
+        "Bar chart: distribution of digital presence scores (1-5)",
+    ],
+    "Topics": [
+        "How many companies are in the 'it_software_digital_it_services' topic?",
+        "Bar chart: number of firms per topic across all 11 categories",
+        "What is the Scaler 2024 rate per topic? Show as a sorted bar chart with the 11.7% baseline",
+    ],
+    "Financials": [
+        "Mean ROE 2020 vs 2024 for scalers vs non-scalers",
+        "Line chart: average solvency ratio by year (2020-2024)",
+        "Top 10 firms by Operating revenue 2024",
     ],
     "Compound": [
         "Give me an overview of Dortmund: pie chart of top sectors, number of scalers 2024, and a short report",
@@ -1545,9 +1819,10 @@ if submit and question:
             is_connection = "Connection" in err_type
 
             if is_timeout:
+                actual_timeout = LLM_TIMEOUT_TEXT_SECONDS if approach == "text" else LLM_TIMEOUT_SECONDS
                 friendly = (
                     f"⏱️ The {approach} agent timed out after "
-                    f"{LLM_TIMEOUT_SECONDS}s. The current model ({llm_model}) is likely slow or overloaded. "
+                    f"{actual_timeout}s. The current model ({llm_model}) is likely slow or overloaded. "
                     f"Try: a smaller / faster model, a different provider, or enable Token-saving mode."
                 )
             elif is_rate_limit:
