@@ -1604,8 +1604,8 @@ with st.expander("📊 **Statistical Findings — Logit Regression on Scaler 202
     st.markdown(
         f"""
         <div style="font-size:0.92rem; color:{WHU_DARK_GRAY}; line-height:1.55;">
-        <b>Model:</b> <code>Scaler 2024 ~ 10 industry topics + firm_age + log(employees 2024)</code><br>
-        <b>Sample:</b> N = 896 firms · 106 positive (11.7%) · Pseudo&nbsp;R² = 0.131 ·
+        <b>Model:</b> <code>Scaler 2024 ~ 10 industry topics + firm_age + log(employees 2024) + digital_presence_score</code><br>
+        <b>Sample:</b> N = 896 firms · 106 positive (11.7%) · Pseudo&nbsp;R² ≈ 0.13 ·
         Reference topic: <code>environment_utilities_recycling_energy</code>
         </div>
         """,
@@ -1614,15 +1614,21 @@ with st.expander("📊 **Statistical Findings — Logit Regression on Scaler 202
 
     st.markdown("##### Significant predictors (p < 0.1)")
     findings = pd.DataFrame([
-        ("gastronomy_tourism_sports_leisure",        2.21, 0.011, "↑ higher", "**"),
-        ("it_software_digital_it_services",          1.84, 0.035, "↑ higher", "**"),
-        ("finance_legal_tax_insurance",              1.75, 0.082, "↑ higher", "*"),
+        ("gastronomy_tourism_sports_leisure",        2.21, 0.012, "↑ higher", "**"),
+        ("it_software_digital_it_services",          1.82, 0.043, "↑ higher", "**"),
+        ("finance_legal_tax_insurance",              1.76, 0.081, "↑ higher", "*"),
         ("log_emp_2024",                             1.65, 0.000, "↑ higher", "***"),
         ("firm_age",                                 0.97, 0.000, "↓ lower",  "***"),
         ("retail_wholesale_consumer_commerce",       0.53, 0.032, "↓ lower",  "**"),
-        ("industrial_machinery_metal_manufacturing", 0.49, 0.051, "↓ lower",  "*"),
+        ("industrial_machinery_metal_manufacturing", 0.49, 0.052, "↓ lower",  "*"),
     ], columns=["Predictor", "Odds Ratio", "p-value", "Effect", "Sig"])
     st.dataframe(findings, hide_index=True, use_container_width=True)
+
+    st.caption(
+        "**Non-significant predictors:** healthcare, logistics, automotive, education, "
+        "construction (all p > 0.1), and **digital_presence_score** (OR = 1.05, p = 0.68) — "
+        "see takeaways below for interpretation."
+    )
 
     c1, c2 = st.columns([2, 1])
     with c1:
@@ -1638,9 +1644,11 @@ with st.expander("📊 **Statistical Findings — Logit Regression on Scaler 202
         st.markdown("##### Key takeaways")
         st.markdown(
             """
-- **IT/software firms** have **84 % higher odds** of scaling than the reference sector.
-- **Industrial manufacturing** has **51 % lower odds** — the lowest scaling industry in the sample.
-- **Larger and younger firms scale more often**: doubling employees → +65 % odds; each year older → −3 % odds.
+- **IT/software firms** have **82 % higher odds** of scaling than the reference sector.
+- **Gastronomy/tourism** is the strongest scaler (**+121 %** odds) — a Dortmund-specific finding likely tied to the city's BVB / event ecosystem.
+- **Industrial manufacturing** has **51 % lower odds** — Dortmund's traditional sector struggles to scale.
+- **Firm characteristics dominate**: doubling employees → **+65 %** odds; each additional year of age → **−3 %** odds.
+- **Digital presence does *not* independently predict scaling** (OR = 1.05, n.s.) once industry is controlled — digital visibility is an industry phenomenon, not an independent driver.
 - The **construction effect from descriptive statistics disappears in the multivariate model** — its low scaling rate reflects firm demographics, not industry dynamics.
 """
         )
